@@ -3,6 +3,7 @@ package main
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -cflags "-O2 -g -Wall" netwatch ./bpf/netwatch.bpf.c -- -I/usr/include -I/usr/include/aarch64-linux-gnu
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
@@ -12,116 +13,296 @@ import (
 	"strings"
 	"time"
 
+	"docker-net-ebpf/netwatch"
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"golang.org/x/sys/unix"
 )
 
-const (
-	dirIngress uint8 = 0
-	dirEgress  uint8 = 1
-)
-
-type trafficKey struct {
-	CgroupID  uint64
-	Direction uint8
-	Pad       [7]byte
+type dockerResolver struct {
+	containers map[uint64]netwatch.ContainerInfo
 }
 
-type trafficValue struct {
-	Bytes   uint64
-	Packets uint64
+type ebpfCollector struct {
+	objs  netwatchObjects
+	links map[uint64][]link.Link
 }
 
-type containerTarget struct {
-	ID         string
-	Name       string
-	CgroupID   uint64
-	CgroupPath string
+type simpleAggregator struct {
+	resolver netwatch.Resolver
 }
 
-type aggregate struct {
-	Name      string
-	ID        string
-	RxBytes   uint64
-	TxBytes   uint64
-	RxPackets uint64
-	TxPackets uint64
-}
+type consoleOutput struct{}
 
 func main() {
 	if os.Geteuid() != 0 {
 		log.Fatal("run with sudo")
 	}
 
-	targets, err := discoverDockerCgroups()
+	ctx := context.Background()
+
+	resolver := &dockerResolver{}
+	containers, err := resolver.Discover(ctx)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	if len(targets) == 0 {
+	if len(containers) == 0 {
 		log.Fatal("no docker container cgroups found")
 	}
 
-	var objs netwatchObjects
-	if err := loadNetwatchObjects(&objs, nil); err != nil {
-		log.Fatalf("loading eBPF objects: %v", err)
+	collector, err := newEBPFCollector()
+	if err != nil {
+		log.Fatal(err)
 	}
-	defer objs.Close()
+	defer collector.Close()
 
-	var links []link.Link
-	defer func() {
-		for _, l := range links {
-			_ = l.Close()
-		}
-	}()
-
-	for _, t := range targets {
-		ingress, err := link.AttachCgroup(link.CgroupOptions{
-			Path:    t.CgroupPath,
-			Attach:  ebpf.AttachCGroupInetIngress,
-			Program: objs.CountIngress,
-		})
-		if err != nil {
-			log.Printf("failed attaching ingress to %s: %v", t.Name, err)
-		} else {
-			links = append(links, ingress)
+	for _, container := range containers {
+		if err := collector.Attach(ctx, container); err != nil {
+			log.Printf("attach %s: %v", container.Name, err)
+			continue
 		}
 
-		egress, err := link.AttachCgroup(link.CgroupOptions{
-			Path:    t.CgroupPath,
-			Attach:  ebpf.AttachCGroupInetEgress,
-			Program: objs.CountEgress,
-		})
-		if err != nil {
-			log.Printf("failed attaching egress to %s: %v", t.Name, err)
-		} else {
-			links = append(links, egress)
-		}
-
-		fmt.Printf("attached: %-30s cgroup_id=%d path=%s\n", t.Name, t.CgroupID, t.CgroupPath)
+		fmt.Printf("attached: %-30s cgroup_id=%d path=%s\n", container.Name, container.CgroupID, container.CgroupPath)
 	}
 
-	cgroupToContainer := map[uint64]containerTarget{}
-	for _, t := range targets {
-		cgroupToContainer[t.CgroupID] = t
-	}
+	aggregator := simpleAggregator{resolver: resolver}
+	output := consoleOutput{}
 
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
 	for range ticker.C {
-		results, err := readStats(objs.Stats, cgroupToContainer)
+		raw, err := collector.Collect(ctx)
 		if err != nil {
-			log.Printf("read stats: %v", err)
+			log.Printf("collect: %v", err)
 			continue
 		}
 
-		printTable(results)
+		samples, err := aggregator.Aggregate(raw)
+		if err != nil {
+			log.Printf("aggregate: %v", err)
+			continue
+		}
+
+		if err := output.Write(ctx, samples); err != nil {
+			log.Printf("write output: %v", err)
+		}
 	}
 }
 
-func discoverDockerCgroups() ([]containerTarget, error) {
+func newEBPFCollector() (*ebpfCollector, error) {
+	collector := &ebpfCollector{links: make(map[uint64][]link.Link)}
+
+	if err := loadNetwatchObjects(&collector.objs, nil); err != nil {
+		return nil, fmt.Errorf("loading eBPF objects: %w", err)
+	}
+
+	return collector, nil
+}
+
+func (c *ebpfCollector) Attach(_ context.Context, container netwatch.ContainerInfo) error {
+	var attached []link.Link
+	var attachErrs []string
+
+	ingress, err := link.AttachCgroup(link.CgroupOptions{
+		Path:    container.CgroupPath,
+		Attach:  ebpf.AttachCGroupInetIngress,
+		Program: c.objs.CountIngress,
+	})
+	if err != nil {
+		attachErrs = append(attachErrs, fmt.Sprintf("ingress: %v", err))
+	} else {
+		attached = append(attached, ingress)
+	}
+
+	egress, err := link.AttachCgroup(link.CgroupOptions{
+		Path:    container.CgroupPath,
+		Attach:  ebpf.AttachCGroupInetEgress,
+		Program: c.objs.CountEgress,
+	})
+	if err != nil {
+		attachErrs = append(attachErrs, fmt.Sprintf("egress: %v", err))
+	} else {
+		attached = append(attached, egress)
+	}
+
+	if len(attached) > 0 {
+		c.links[container.CgroupID] = append(c.links[container.CgroupID], attached...)
+	}
+
+	if len(attachErrs) > 0 {
+		return fmt.Errorf(strings.Join(attachErrs, "; "))
+	}
+
+	return nil
+}
+
+func (c *ebpfCollector) Detach(_ context.Context, container netwatch.ContainerInfo) error {
+	for _, l := range c.links[container.CgroupID] {
+		if err := l.Close(); err != nil {
+			return err
+		}
+	}
+
+	delete(c.links, container.CgroupID)
+	return nil
+}
+
+func (c *ebpfCollector) Collect(_ context.Context) ([]netwatch.RawTrafficSample, error) {
+	var key netwatchTrafficKey
+	var values []netwatchTrafficValue
+
+	now := time.Now()
+	iter := c.objs.Stats.Iterate()
+	samples := make([]netwatch.RawTrafficSample, 0)
+
+	for iter.Next(&key, &values) {
+		var total netwatchTrafficValue
+
+		for _, value := range values {
+			total.Bytes += value.Bytes
+			total.Packets += value.Packets
+		}
+
+		direction := netwatch.Ingress
+		if key.Direction == 1 {
+			direction = netwatch.Egress
+		}
+
+		samples = append(samples, netwatch.RawTrafficSample{
+			CgroupID:  key.CgroupId,
+			Direction: direction,
+			Bytes:     total.Bytes,
+			Packets:   total.Packets,
+			Timestamp: now,
+		})
+	}
+
+	if err := iter.Err(); err != nil {
+		return nil, err
+	}
+
+	return samples, nil
+}
+
+func (c *ebpfCollector) Close() error {
+	for _, links := range c.links {
+		for _, l := range links {
+			if err := l.Close(); err != nil {
+				return err
+			}
+		}
+	}
+
+	return c.objs.Close()
+}
+
+func (r *dockerResolver) Discover(_ context.Context) ([]netwatch.ContainerInfo, error) {
+	targets, err := discoverDockerCgroups()
+	if err != nil {
+		return nil, err
+	}
+
+	r.containers = make(map[uint64]netwatch.ContainerInfo, len(targets))
+	containers := make([]netwatch.ContainerInfo, 0, len(targets))
+
+	for _, target := range targets {
+		container := netwatch.ContainerInfo{
+			ID:         target.ID,
+			Name:       target.Name,
+			CgroupID:   target.CgroupID,
+			CgroupPath: target.CgroupPath,
+			Runtime:    "docker",
+		}
+
+		r.containers[target.CgroupID] = container
+		containers = append(containers, container)
+	}
+
+	return containers, nil
+}
+
+func (r *dockerResolver) Resolve(_ context.Context, cgroupID uint64) (netwatch.ContainerInfo, error) {
+	container, ok := r.containers[cgroupID]
+	if !ok {
+		return netwatch.ContainerInfo{}, fmt.Errorf("container for cgroup %d not found", cgroupID)
+	}
+
+	return container, nil
+}
+
+func (a simpleAggregator) Aggregate(raw []netwatch.RawTrafficSample) ([]netwatch.TrafficSample, error) {
+	totals := make(map[uint64]*netwatch.TrafficSample)
+
+	for _, sample := range raw {
+		container, err := a.resolver.Resolve(context.Background(), sample.CgroupID)
+		if err != nil {
+			continue
+		}
+
+		traffic := totals[sample.CgroupID]
+		if traffic == nil {
+			traffic = &netwatch.TrafficSample{
+				Timestamp: sample.Timestamp,
+				Container: container,
+			}
+			totals[sample.CgroupID] = traffic
+		}
+
+		switch sample.Direction {
+		case netwatch.Ingress:
+			traffic.RxBytesTotal += sample.Bytes
+			traffic.RxPacketsTotal += sample.Packets
+		case netwatch.Egress:
+			traffic.TxBytesTotal += sample.Bytes
+			traffic.TxPacketsTotal += sample.Packets
+		}
+	}
+
+	results := make([]netwatch.TrafficSample, 0, len(totals))
+	for _, sample := range totals {
+		results = append(results, *sample)
+	}
+
+	sort.Slice(results, func(i, j int) bool {
+		left := results[i].RxBytesTotal + results[i].TxBytesTotal
+		right := results[j].RxBytesTotal + results[j].TxBytesTotal
+		return left > right
+	})
+
+	return results, nil
+}
+
+func (a simpleAggregator) Reset() {}
+
+func (consoleOutput) Write(_ context.Context, samples []netwatch.TrafficSample) error {
+	fmt.Print("\033[H\033[2J")
+	fmt.Println("Docker network usage from eBPF cgroup_skb")
+	fmt.Println(strings.Repeat("-", 100))
+	fmt.Printf("%-30s %-15s %-15s %-15s %-15s\n", "CONTAINER", "ID", "RX", "TX", "TOTAL")
+	fmt.Println(strings.Repeat("-", 100))
+
+	for _, sample := range samples {
+		total := sample.RxBytesTotal + sample.TxBytesTotal
+		fmt.Printf(
+			"%-30s %-15s %-15s %-15s %-15s\n",
+			sample.Container.Name,
+			shortID(sample.Container.ID),
+			humanBytes(sample.RxBytesTotal),
+			humanBytes(sample.TxBytesTotal),
+			humanBytes(total),
+		)
+	}
+
+	return nil
+}
+
+func (consoleOutput) Close() error {
+	return nil
+}
+
+func discoverDockerCgroups() ([]netwatch.ContainerInfo, error) {
 	out, err := exec.Command(
 		"docker",
 		"ps",
@@ -132,9 +313,9 @@ func discoverDockerCgroups() ([]containerTarget, error) {
 		return nil, err
 	}
 
-	var targets []containerTarget
-
+	var containers []netwatch.ContainerInfo
 	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+
 	for _, line := range lines {
 		parts := strings.Fields(line)
 		if len(parts) < 2 {
@@ -143,46 +324,40 @@ func discoverDockerCgroups() ([]containerTarget, error) {
 
 		id := parts[0]
 		name := parts[1]
-
 		path, err := findCgroupPath(id)
 		if err != nil {
 			log.Printf("could not find cgroup for %s: %v", name, err)
 			continue
 		}
 
-		cgid, err := cgroupID(path)
+		cgroupID, err := cgroupID(path)
 		if err != nil {
 			log.Printf("could not stat cgroup for %s: %v", name, err)
 			continue
 		}
 
-		targets = append(targets, containerTarget{
+		containers = append(containers, netwatch.ContainerInfo{
 			ID:         id,
 			Name:       name,
-			CgroupID:   cgid,
+			CgroupID:   cgroupID,
 			CgroupPath: path,
+			Runtime:    "docker",
 		})
 	}
 
-	return targets, nil
+	return containers, nil
 }
 
 func findCgroupPath(containerID string) (string, error) {
 	root := "/sys/fs/cgroup"
-
 	var found string
 
 	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			return nil
-		}
-
-		if !d.IsDir() {
+		if err != nil || !d.IsDir() {
 			return nil
 		}
 
 		base := filepath.Base(path)
-
 		if strings.Contains(base, containerID) || strings.Contains(path, containerID) {
 			found = path
 			return filepath.SkipAll
@@ -190,7 +365,6 @@ func findCgroupPath(containerID string) (string, error) {
 
 		return nil
 	})
-
 	if err != nil {
 		return "", err
 	}
@@ -204,87 +378,11 @@ func findCgroupPath(containerID string) (string, error) {
 
 func cgroupID(path string) (uint64, error) {
 	var st unix.Stat_t
-
 	if err := unix.Stat(path, &st); err != nil {
 		return 0, err
 	}
 
 	return st.Ino, nil
-}
-
-func readStats(statsMap *ebpf.Map, cgroups map[uint64]containerTarget) ([]aggregate, error) {
-	out := map[uint64]*aggregate{}
-
-	var key trafficKey
-	var values []trafficValue
-
-	iter := statsMap.Iterate()
-
-	for iter.Next(&key, &values) {
-		var total trafficValue
-
-		for _, v := range values {
-			total.Bytes += v.Bytes
-			total.Packets += v.Packets
-		}
-
-		target, ok := cgroups[key.CgroupID]
-		if !ok {
-			continue
-		}
-
-		if _, ok := out[key.CgroupID]; !ok {
-			out[key.CgroupID] = &aggregate{
-				Name: target.Name,
-				ID:   target.ID,
-			}
-		}
-
-		switch key.Direction {
-		case dirIngress:
-			out[key.CgroupID].RxBytes += total.Bytes
-			out[key.CgroupID].RxPackets += total.Packets
-		case dirEgress:
-			out[key.CgroupID].TxBytes += total.Bytes
-			out[key.CgroupID].TxPackets += total.Packets
-		}
-	}
-
-	if err := iter.Err(); err != nil {
-		return nil, err
-	}
-
-	var results []aggregate
-	for _, r := range out {
-		results = append(results, *r)
-	}
-
-	sort.Slice(results, func(i, j int) bool {
-		return results[i].TxBytes+results[i].RxBytes > results[j].TxBytes+results[j].RxBytes
-	})
-
-	return results, nil
-}
-
-func printTable(results []aggregate) {
-	fmt.Print("\033[H\033[2J")
-	fmt.Println("Docker network usage from eBPF cgroup_skb")
-	fmt.Println(strings.Repeat("-", 100))
-	fmt.Printf("%-30s %-15s %-15s %-15s %-15s\n", "CONTAINER", "ID", "RX", "TX", "TOTAL")
-	fmt.Println(strings.Repeat("-", 100))
-
-	for _, r := range results {
-		total := r.RxBytes + r.TxBytes
-
-		fmt.Printf(
-			"%-30s %-15s %-15s %-15s %-15s\n",
-			r.Name,
-			r.ID,
-			humanBytes(r.RxBytes),
-			humanBytes(r.TxBytes),
-			humanBytes(total),
-		)
-	}
 }
 
 func shortID(id string) string {
@@ -303,7 +401,6 @@ func humanBytes(bytes uint64) string {
 	}
 
 	div, exp := uint64(unit), 0
-
 	for n := bytes / unit; n >= unit; n /= unit {
 		div *= unit
 		exp++
@@ -311,4 +408,3 @@ func humanBytes(bytes uint64) string {
 
 	return fmt.Sprintf("%.1f%ciB", float64(bytes)/float64(div), "KMGTPE"[exp])
 }
-
