@@ -1,12 +1,12 @@
 package main
 
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -cflags "-O2 -g -Wall" netwatch ./bpf/netwatch.bpf.c -- -I/usr/include
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -cflags "-O2 -g -Wall" netwatch ./bpf/netwatch.bpf.c -- -I/usr/include -I/usr/include/aarch64-linux-gnu
 
 import (
-	"context"
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -14,8 +14,6 @@ import (
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/client"
 	"golang.org/x/sys/unix"
 )
 
@@ -56,17 +54,7 @@ func main() {
 		log.Fatal("run with sudo")
 	}
 
-	ctx := context.Background()
-
-	cli, err := client.NewClientWithOpts(
-		client.FromEnv,
-		client.WithAPIVersionNegotiation(),
-	)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	targets, err := discoverDockerCgroups(ctx, cli)
+	targets, err := discoverDockerCgroups()
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -133,21 +121,30 @@ func main() {
 	}
 }
 
-func discoverDockerCgroups(ctx context.Context, cli *client.Client) ([]containerTarget, error) {
-	containers, err := cli.ContainerList(ctx, container.ListOptions{})
+func discoverDockerCgroups() ([]containerTarget, error) {
+	out, err := exec.Command(
+		"docker",
+		"ps",
+		"--format",
+		"{{.ID}} {{.Names}}",
+	).Output()
 	if err != nil {
 		return nil, err
 	}
 
 	var targets []containerTarget
 
-	for _, c := range containers {
-		name := shortID(c.ID)
-		if len(c.Names) > 0 {
-			name = strings.TrimPrefix(c.Names[0], "/")
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	for _, line := range lines {
+		parts := strings.Fields(line)
+		if len(parts) < 2 {
+			continue
 		}
 
-		path, err := findCgroupPath(c.ID)
+		id := parts[0]
+		name := parts[1]
+
+		path, err := findCgroupPath(id)
 		if err != nil {
 			log.Printf("could not find cgroup for %s: %v", name, err)
 			continue
@@ -160,7 +157,7 @@ func discoverDockerCgroups(ctx context.Context, cli *client.Client) ([]container
 		}
 
 		targets = append(targets, containerTarget{
-			ID:         shortID(c.ID),
+			ID:         id,
 			Name:       name,
 			CgroupID:   cgid,
 			CgroupPath: path,
