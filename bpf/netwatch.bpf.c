@@ -60,6 +60,12 @@ static __always_inline int count_packet(struct __sk_buff *skb, __u8 direction) {
     struct traffic_value zero = {};
     struct traffic_value *value;
 
+    /*
+     * In cgroup_skb programs we want the cgroup associated with the skb being
+     * evaluated, not the current task's cgroup. Using task context breaks
+     * ingress attribution because receive-side processing doesn't reliably run
+     * in the sending task's cgroup.
+     */
     key.cgroup_id = bpf_skb_cgroup_id(skb);
     key.direction = direction;
 

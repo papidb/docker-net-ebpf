@@ -34,6 +34,8 @@ func TestUDPEgressByteCount(t *testing.T) {
 		t.Skip("requires root")
 	}
 
+	// The echo server must stay outside the observed cgroup or both sides of the
+	// exchange get attributed to the same test container and the counts double.
 	serverAddr := startUDPEchoServerProcess(t)
 
 	cgroupPath := setupTestCgroup(t)
@@ -102,6 +104,8 @@ func TestUDPIngressByteCount(t *testing.T) {
 		t.Skip("requires root")
 	}
 
+	// Keep the server outside the observed cgroup so ingress reflects only the
+	// reply path into the client we moved into the test cgroup.
 	serverAddr := startUDPEchoServerProcess(t)
 
 	cgroupPath := setupTestCgroup(t)
@@ -170,6 +174,8 @@ func TestUDPLargePayloadByteCount(t *testing.T) {
 		t.Skip("requires root")
 	}
 
+	// Large payloads are where silent off-by-one header bugs show up, so this
+	// uses the same isolated server pattern as the smaller UDP tests.
 	serverAddr := startUDPEchoServerProcess(t)
 
 	cgroupPath := setupTestCgroup(t)
@@ -271,6 +277,8 @@ func TestTCPByteCountMatchesTcpdump(t *testing.T) {
 		t.Skip("tcpdump not installed")
 	}
 
+	// TCP carries handshake, ACK, and teardown traffic, so we use tcpdump as an
+	// independent IP-layer ground truth instead of re-implementing TCP math here.
 	serverAddr := startTCPEchoServerProcess(t)
 	serverPort := mustAddrPort(t, serverAddr).Port()
 	stopCapture := startTCPDumpCapture(t, serverPort)
@@ -473,6 +481,8 @@ func mustCgroupID(t *testing.T, path string) uint64 {
 func startUDPEchoServerProcess(t *testing.T) string {
 	t.Helper()
 
+	// The helper process stays in the parent's original cgroup while the test
+	// process moves into the observed cgroup before generating traffic.
 	cmd := exec.Command(os.Args[0], "-test.run=TestUDPServerHelperProcess")
 	cmd.Env = append(os.Environ(), "GO_WANT_UDP_SERVER_HELPER=1")
 	stdout, err := cmd.StdoutPipe()
@@ -502,6 +512,8 @@ func startUDPEchoServerProcess(t *testing.T) string {
 func startTCPEchoServerProcess(t *testing.T) string {
 	t.Helper()
 
+	// TCP uses the same subprocess pattern so only the client side is attributed
+	// to the observed cgroup during the integration test.
 	cmd := exec.Command(os.Args[0], "-test.run=TestTCPServerHelperProcess")
 	cmd.Env = append(os.Environ(), "GO_WANT_TCP_SERVER_HELPER=1")
 	stdout, err := cmd.StdoutPipe()
@@ -531,6 +543,8 @@ func startTCPEchoServerProcess(t *testing.T) string {
 func startTCPDumpCapture(t *testing.T, serverPort uint16) func() []string {
 	t.Helper()
 
+	// tcpdump gives us an external measurement at the same IP layer the BPF
+	// program counts, which is more reliable than reconstructing TCP overhead.
 	cmd := exec.Command("tcpdump", "-n", "-l", "-i", "lo", "-vvv", "tcp", "and", "port", strconv.Itoa(int(serverPort)))
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
