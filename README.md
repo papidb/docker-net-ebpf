@@ -48,7 +48,7 @@ Collector → Resolver → Aggregator → Output
 |------------|-------------------------------------------------------|------------------------|
 | Collector  | Attach eBPF programs to cgroups, read counters        | `netwatch.Collector`   |
 | Resolver   | Map cgroup IDs to container names via runtime APIs    | `netwatch.Resolver`    |
-| Aggregator | Compute deltas from cumulative counters, derive rates | `netwatch.Aggregator`  |
+| Aggregator | Normalize cumulative counters into container or destination totals | `netwatch.Aggregator`  |
 | Output     | Write processed samples to a sink                     | `netwatch.Output`      |
 
 Interfaces and data types live in the `netwatch/` package. See `netwatch/interfaces.go` and `netwatch/types.go`.
@@ -56,30 +56,33 @@ Interfaces and data types live in the `netwatch/` package. See `netwatch/interfa
 ### Data Flow
 
 ```
-RawTrafficSample (cumulative bytes/packets per cgroup+direction)
+RawTrafficSample (cumulative bytes/packets per cgroup+direction+remote IP)
         ↓ Aggregator
-TrafficSample (deltas, rates, resolved container identity)
+TrafficSample (resolved container identity + remote IP + current totals)
         ↓ Output
 sink (terminal, JSONL, SQLite, Prometheus, ...)
 ```
 
 ### eBPF Program
 
-`bpf/netwatch.bpf.c` — two `cgroup_skb` programs (`count_ingress`, `count_egress`) that increment per-CPU hash map entries keyed by `(cgroup_id, direction)`.
+`bpf/netwatch.bpf.c` — two `cgroup_skb` programs (`count_ingress`, `count_egress`) that increment per-CPU hash map entries keyed by `(cgroup_id, remote_ip4, direction, protocol)` for the current IPv4/TCP MVP.
 
 ## Current State
 
-The eBPF collector and cgroup attachment work. The current `main.go` is a monolith that does collection, resolution, and terminal output inline. No delta computation, no pluggable outputs.
+The eBPF collector and cgroup attachment work. `main.go` now wires four explicit stages together using the `netwatch` interfaces, while still keeping a simple synchronous loop and console output by default.
 
 What exists:
 - eBPF program with per-CPU hash map (working)
 - Docker container discovery via `docker ps` + cgroup walk
+- `netwatch.Collector`, `Resolver`, `Aggregator`, and `Output` interfaces
+- Concrete Docker resolver, eBPF collector, simple aggregator, and console output wiring in `main.go`
 - Cumulative counter display in terminal
+- Destination-aware sample model and console view for IPv4/TCP traffic by remote IP
 
 What's defined but not yet implemented:
-- `netwatch.Collector` interface
-- `netwatch.Resolver` interface (Docker, containerd, Kubernetes)
-- `netwatch.Aggregator` interface (delta computation, counter reset handling)
+- Delta-based aggregation and counter reset handling
+- Proper Linux-side regeneration of BPF bindings after the IPv4/TCP destination key change (`go generate ./...` must be run on Linux with kernel headers and `llvm-strip` available)
+- UDP and IPv6 destination tracking
 - `netwatch.Output` interface (JSONL, SQLite, Prometheus, Kafka)
 
 ## Project Structure
@@ -87,21 +90,25 @@ What's defined but not yet implemented:
 ```
 ├── bpf/
 │   └── netwatch.bpf.c          # eBPF cgroup_skb programs
+├── internal/
+│   ├── aggregator/simple/       # Simple aggregator implementation
+│   ├── collector/ebpf/          # eBPF collector + generated bindings
+│   ├── output/console/          # Console output implementation
+│   └── resolver/docker/         # Docker resolver implementation
 ├── netwatch/
 │   ├── types.go                 # RawTrafficSample, TrafficSample, ContainerInfo
 │   └── interfaces.go            # Collector, Resolver, Aggregator, Output
-├── main.go                      # Monolith (to be refactored)
-├── netwatch_bpfel.go            # Generated eBPF bindings (little-endian)
-├── netwatch_bpfeb.go            # Generated eBPF bindings (big-endian)
+├── main.go                      # Thin pipeline orchestration
 └── go.mod
 ```
 
 ## Roadmap
 
-- [ ] Extract collector, resolver, aggregator from main.go into interface implementations
+- [x] Extract collector, resolver, aggregator, and console output into interface-based pipeline wiring
 - [ ] Delta computation and counter reset handling
+- [ ] Regenerate BPF objects on Linux for the destination-aware IPv4/TCP key
 - [ ] JSONL output
 - [ ] SQLite output with time-range queries
 - [ ] Prometheus metrics exporter
 - [ ] containerd resolver (Kubernetes pod support)
-- [ ] Destination-level visibility (container → IP → port → bytes)
+- [ ] Extend destination-level visibility beyond IPv4/TCP (UDP, IPv6, DNS/service enrichment, optional port breakdown)

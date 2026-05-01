@@ -3,14 +3,12 @@
 #include <linux/bpf.h>
 #include <linux/in.h>
 #include <linux/ip.h>
-#include <linux/tcp.h>
 #include <bpf/bpf_helpers.h>
 
 char LICENSE[] SEC("license") = "Dual BSD/GPL";
 
 #define DIR_INGRESS 0
 #define DIR_EGRESS  1
-#define PROTO_TCP   6
 
 struct traffic_key {
     __u64 cgroup_id;
@@ -32,18 +30,22 @@ struct {
     __type(value, struct traffic_value);
 } stats SEC(".maps");
 
-static __always_inline int fill_ipv4_tcp_key(struct __sk_buff *skb, __u8 direction, struct traffic_key *key) {
+static __always_inline int fill_ipv4_key(struct __sk_buff *skb, __u8 direction, struct traffic_key *key) {
     struct iphdr iph;
 
     if (bpf_skb_load_bytes(skb, 0, &iph, sizeof(iph)) < 0) {
         return 0;
     }
 
-    if (iph.version != 4 || iph.protocol != IPPROTO_TCP) {
+    if (iph.version != 4) {
         return 0;
     }
 
-    key->protocol = PROTO_TCP;
+    if (iph.protocol != IPPROTO_TCP && iph.protocol != IPPROTO_UDP) {
+        return 0;
+    }
+
+    key->protocol = iph.protocol;
     if (direction == DIR_EGRESS) {
         key->remote_ip4 = iph.daddr;
     } else {
@@ -58,10 +60,10 @@ static __always_inline int count_packet(struct __sk_buff *skb, __u8 direction) {
     struct traffic_value zero = {};
     struct traffic_value *value;
 
-    key.cgroup_id = bpf_get_current_cgroup_id();
+    key.cgroup_id = bpf_skb_cgroup_id(skb);
     key.direction = direction;
 
-    if (!fill_ipv4_tcp_key(skb, direction, &key)) {
+    if (!fill_ipv4_key(skb, direction, &key)) {
         return 1;
     }
 
