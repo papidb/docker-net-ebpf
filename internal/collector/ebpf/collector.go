@@ -56,7 +56,7 @@ func (c *Collector) Attach(_ context.Context, container netwatch.ContainerInfo) 
 	}
 
 	if len(attachErrs) > 0 {
-		return fmt.Errorf(strings.Join(attachErrs, "; "))
+		return fmt.Errorf("attach failed: %s", strings.Join(attachErrs, "; "))
 	}
 
 	return nil
@@ -82,37 +82,7 @@ func (c *Collector) Collect(_ context.Context) ([]netwatch.RawTrafficSample, err
 	samples := make([]netwatch.RawTrafficSample, 0)
 
 	for iter.Next(&key, &values) {
-		var total netwatchTrafficValue
-
-		for _, value := range values {
-			total.Bytes += value.Bytes
-			total.Packets += value.Packets
-		}
-
-		direction := netwatch.Ingress
-		if key.Direction == 1 {
-			direction = netwatch.Egress
-		}
-
-		protocol := netwatch.ProtocolUnknown
-		switch key.Protocol {
-		case uint8(netwatch.ProtocolTCP):
-			protocol = netwatch.ProtocolTCP
-		case uint8(netwatch.ProtocolUDP):
-			protocol = netwatch.ProtocolUDP
-		}
-
-		samples = append(samples, netwatch.RawTrafficSample{
-			CgroupID:  key.CgroupId,
-			Direction: direction,
-			Remote: netwatch.Endpoint{
-				Addr:     addrFromKernelIPv4(key.RemoteIp4),
-				Protocol: protocol,
-			},
-			Bytes:     total.Bytes,
-			Packets:   total.Packets,
-			Timestamp: now,
-		})
+		samples = append(samples, decodeSample(key, values, now))
 	}
 
 	if err := iter.Err(); err != nil {
@@ -120,6 +90,48 @@ func (c *Collector) Collect(_ context.Context) ([]netwatch.RawTrafficSample, err
 	}
 
 	return samples, nil
+}
+
+func decodeSample(key netwatchTrafficKey, perCPUValues []netwatchTrafficValue, ts time.Time) netwatch.RawTrafficSample {
+	totalBytes, totalPackets := sumPerCPU(perCPUValues)
+
+	return netwatch.RawTrafficSample{
+		CgroupID:  key.CgroupId,
+		Direction: decodeDirection(key.Direction),
+		Remote: netwatch.Endpoint{
+			Addr:     addrFromKernelIPv4(key.RemoteIp4),
+			Protocol: decodeProtocol(key.Protocol),
+		},
+		Bytes:     totalBytes,
+		Packets:   totalPackets,
+		Timestamp: ts,
+	}
+}
+
+func sumPerCPU(values []netwatchTrafficValue) (bytes, packets uint64) {
+	for _, v := range values {
+		bytes += v.Bytes
+		packets += v.Packets
+	}
+	return
+}
+
+func decodeDirection(raw uint8) netwatch.Direction {
+	if raw == 1 {
+		return netwatch.Egress
+	}
+	return netwatch.Ingress
+}
+
+func decodeProtocol(raw uint8) netwatch.Protocol {
+	switch raw {
+	case uint8(netwatch.ProtocolTCP):
+		return netwatch.ProtocolTCP
+	case uint8(netwatch.ProtocolUDP):
+		return netwatch.ProtocolUDP
+	default:
+		return netwatch.ProtocolUnknown
+	}
 }
 
 func (c *Collector) Close() error {
