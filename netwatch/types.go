@@ -1,6 +1,9 @@
 package netwatch
 
-import "time"
+import (
+	"net/netip"
+	"time"
+)
 
 // Direction represents the traffic direction relative to the container.
 type Direction uint8
@@ -21,6 +24,32 @@ func (d Direction) String() string {
 	}
 }
 
+// Protocol represents the network protocol carried by a sample.
+type Protocol uint8
+
+const (
+	ProtocolUnknown Protocol = 0
+	ProtocolTCP     Protocol = 6
+	ProtocolUDP     Protocol = 17
+)
+
+func (p Protocol) String() string {
+	switch p {
+	case ProtocolTCP:
+		return "tcp"
+	case ProtocolUDP:
+		return "udp"
+	default:
+		return "unknown"
+	}
+}
+
+// Endpoint identifies the remote network location associated with traffic.
+type Endpoint struct {
+	Addr     netip.Addr
+	Protocol Protocol
+}
+
 // ContainerInfo holds the resolved identity of a container.
 type ContainerInfo struct {
 	ID         string
@@ -35,6 +64,7 @@ type ContainerInfo struct {
 type RawTrafficSample struct {
 	CgroupID  uint64
 	Direction Direction
+	Remote    Endpoint
 	Bytes     uint64
 	Packets   uint64
 	Timestamp time.Time
@@ -47,6 +77,7 @@ type TrafficSample struct {
 	Interval  time.Duration
 
 	Container ContainerInfo
+	Remote    Endpoint
 
 	RxBytesDelta   uint64
 	TxBytesDelta   uint64
