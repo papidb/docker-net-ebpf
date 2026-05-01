@@ -1,0 +1,16 @@
+# eBPF generated files
+*_bpfel.go
+*_bpfeb.go
+*.o
+
+# optional: if bpf2go outputs headers
+*.h
+
+# build artifacts
+bin/
+dist/
+
+# Go
+*.exe
+*.test
+*.out
