@@ -5,6 +5,7 @@ package ebpfcollector
 import (
 	"bufio"
 	"context"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"net"
@@ -12,10 +13,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -277,11 +276,11 @@ func TestTCPByteCountMatchesTcpdump(t *testing.T) {
 		t.Skip("tcpdump not installed")
 	}
 
-	// TCP carries handshake, ACK, and teardown traffic, so we use tcpdump as an
-	// independent IP-layer ground truth instead of re-implementing TCP math here.
+	// TCP carries handshake, ACK, and teardown traffic, so we capture packets and
+	// sum IPv4 total lengths directly instead of re-implementing TCP math here.
 	serverAddr := startTCPEchoServerProcess(t)
 	serverPort := mustAddrPort(t, serverAddr).Port()
-	stopCapture := startTCPDumpCapture(t, serverPort)
+	stopCapture := startPCAPCapture(t, serverPort)
 
 	cgroupPath := setupTestCgroup(t)
 	cgroupID := mustCgroupID(t, cgroupPath)
@@ -310,14 +309,14 @@ func TestTCPByteCountMatchesTcpdump(t *testing.T) {
 	clientPort := runTCPExchange(t, serverAddr, payload)
 
 	time.Sleep(150 * time.Millisecond)
-	tcpdumpLines := stopCapture()
+	packets := stopCapture()
 
 	samples, err := collector.Collect(ctx)
 	if err != nil {
 		t.Fatalf("Collect(): %v", err)
 	}
 
-	expectedIngress, expectedEgress := sumTCPDumpTraffic(t, tcpdumpLines, serverPort, clientPort)
+	expectedIngress, expectedEgress := sumCapturedTraffic(t, packets, serverPort, clientPort)
 	actualIngress, actualEgress := sumCollectorTraffic(samples, cgroupID, netwatch.ProtocolTCP)
 
 	if actualEgress.Packets != expectedEgress.Packets {
@@ -397,9 +396,15 @@ type trafficTotals struct {
 }
 
 var (
-	tcpdumpLengthPattern = regexp.MustCompile(`length (\d+)\)`)
-	tcpdumpPortsPattern  = regexp.MustCompile(`127\.0\.0\.1\.(\d+) > 127\.0\.0\.1\.(\d+):`)
+	pcapMagicMicrosecondsLittleEndian = []byte{0xd4, 0xc3, 0xb2, 0xa1}
 )
+
+type capturedPacket struct {
+	IPTotalLen uint16
+	Protocol   uint8
+	SrcPort    uint16
+	DstPort    uint16
+}
 
 func sumCollectorTraffic(samples []netwatch.RawTrafficSample, cgroupID uint64, protocol netwatch.Protocol) (ingress, egress trafficTotals) {
 	for _, s := range samples {
@@ -417,41 +422,30 @@ func sumCollectorTraffic(samples []netwatch.RawTrafficSample, cgroupID uint64, p
 	return
 }
 
-func sumTCPDumpTraffic(t *testing.T, lines []string, serverPort, clientPort uint16) (ingress, egress trafficTotals) {
+func sumCapturedTraffic(t *testing.T, packets []capturedPacket, serverPort, clientPort uint16) (ingress, egress trafficTotals) {
 	t.Helper()
 
-	for _, line := range lines {
-		lengthMatch := tcpdumpLengthPattern.FindStringSubmatch(line)
-		portsMatch := tcpdumpPortsPattern.FindStringSubmatch(line)
-		if len(lengthMatch) != 2 || len(portsMatch) != 3 {
+	for _, packet := range packets {
+		if packet.Protocol != uint8(netwatch.ProtocolTCP) {
 			continue
 		}
 
-		ipLength, err := strconv.Atoi(lengthMatch[1])
-		if err != nil {
-			t.Fatalf("parse tcpdump IP length from %q: %v", line, err)
-		}
-		srcPort, err := strconv.Atoi(portsMatch[1])
-		if err != nil {
-			t.Fatalf("parse tcpdump src port from %q: %v", line, err)
-		}
-		dstPort, err := strconv.Atoi(portsMatch[2])
-		if err != nil {
-			t.Fatalf("parse tcpdump dst port from %q: %v", line, err)
-		}
-
 		switch {
-		case uint16(srcPort) == clientPort && uint16(dstPort) == serverPort:
-			egress.Bytes += uint64(ipLength)
+		case packet.SrcPort == clientPort && packet.DstPort == serverPort:
+			egress.Bytes += uint64(packet.IPTotalLen)
 			egress.Packets++
-		case uint16(srcPort) == serverPort && uint16(dstPort) == clientPort:
-			ingress.Bytes += uint64(ipLength)
+		case packet.SrcPort == serverPort && packet.DstPort == clientPort:
+			ingress.Bytes += uint64(packet.IPTotalLen)
 			ingress.Packets++
 		}
 	}
 
 	if ingress.Packets == 0 && egress.Packets == 0 {
-		t.Fatal("tcpdump captured no matching TCP packets")
+		t.Logf("no matching packets: serverPort=%d clientPort=%d total=%d", serverPort, clientPort, len(packets))
+		for i, p := range packets {
+			t.Logf("  [%d] proto=%d src=%d dst=%d iplen=%d", i, p.Protocol, p.SrcPort, p.DstPort, p.IPTotalLen)
+		}
+		t.Fatal("pcap capture contained no matching TCP packets")
 	}
 
 	return
@@ -540,49 +534,148 @@ func startTCPEchoServerProcess(t *testing.T) string {
 	return strings.TrimSpace(addr)
 }
 
-func startTCPDumpCapture(t *testing.T, serverPort uint16) func() []string {
+func startPCAPCapture(t *testing.T, serverPort uint16) func() []capturedPacket {
 	t.Helper()
 
-	// tcpdump gives us an external measurement at the same IP layer the BPF
-	// program counts, which is more reliable than reconstructing TCP overhead.
-	cmd := exec.Command("tcpdump", "-n", "-l", "-i", "lo", "-vvv", "tcp", "and", "port", strconv.Itoa(int(serverPort)))
+	// Write pcap data to stdout (-w -) to avoid any file-path permission issues
+	// on the tmpfs used by t.TempDir() under some Linux configurations.
+	// --immediate-mode disables TPACKET_V3 block-batching so packets are
+	// dispatched to userspace as they arrive rather than waiting for the
+	// block-retirement timeout (~200 ms), which would cause us to miss them
+	// when SIGINT fires after a shorter sleep.
+	cmd := exec.Command("tcpdump", "--immediate-mode", "-i", "lo", "-U", "-w", "-", "tcp", "and", "port", strconv.Itoa(int(serverPort)))
+
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		t.Fatalf("tcpdump stdout pipe: %v", err)
 	}
-	cmd.Stderr = os.Stderr
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		t.Fatalf("tcpdump stderr pipe: %v", err)
+	}
 
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start tcpdump: %v", err)
 	}
 
-	var (
-		mu    sync.Mutex
-		lines []string
-		done  = make(chan struct{})
-	)
-
+	// Collect all pcap bytes from stdout in the background.
+	pcapData := make(chan []byte, 1)
 	go func() {
-		defer close(done)
-		scanner := bufio.NewScanner(stdout)
-		for scanner.Scan() {
-			mu.Lock()
-			lines = append(lines, scanner.Text())
-			mu.Unlock()
-		}
+		data, _ := io.ReadAll(stdout)
+		pcapData <- data
 	}()
 
-	time.Sleep(100 * time.Millisecond)
+	ready := make(chan struct{})
+	go func() {
+		scanner := bufio.NewScanner(stderr)
+		for scanner.Scan() {
+			line := scanner.Text()
+			t.Logf("tcpdump: %s", line)
+			if strings.Contains(line, "listening on") {
+				close(ready)
+				for scanner.Scan() {
+					t.Logf("tcpdump: %s", scanner.Text())
+				}
+				return
+			}
+		}
+		close(ready)
+	}()
 
-	return func() []string {
-		_ = cmd.Process.Signal(os.Interrupt)
-		_ = cmd.Wait()
-		<-done
-
-		mu.Lock()
-		defer mu.Unlock()
-		return append([]string(nil), lines...)
+	select {
+	case <-ready:
+	case <-time.After(2 * time.Second):
+		t.Fatal("tcpdump did not become ready")
 	}
+
+	return func() []capturedPacket {
+		_ = cmd.Process.Signal(os.Interrupt)
+		if err := cmd.Wait(); err != nil {
+			t.Logf("tcpdump exit: %v", err)
+		}
+		data := <-pcapData
+		packets, linkType, err := readPCAPPacketsFromBytes(t, data)
+		if err != nil {
+			t.Fatalf("read pcap: %v", err)
+		}
+		t.Logf("pcap: linkType=%d parsed=%d packets", linkType, len(packets))
+		return packets
+	}
+}
+
+const (
+	dltEN10MB   = 1   // Ethernet
+	dltLinuxSLL = 113 // Linux cooked socket (used by tcpdump on lo)
+)
+
+func readPCAPPacketsFromBytes(t *testing.T, data []byte) ([]capturedPacket, int, error) {
+	t.Helper()
+
+	if len(data) < 24 {
+		return nil, 0, fmt.Errorf("pcap too small (%d bytes)", len(data))
+	}
+	if string(data[:4]) != string(pcapMagicMicrosecondsLittleEndian) {
+		return nil, 0, fmt.Errorf("unsupported pcap magic %x", data[:4])
+	}
+
+	linkType := int(binary.LittleEndian.Uint32(data[20:24]))
+
+	offset := 24
+	var packets []capturedPacket
+	for offset+16 <= len(data) {
+		capturedLen := int(binary.LittleEndian.Uint32(data[offset+8 : offset+12]))
+		offset += 16
+		if offset+capturedLen > len(data) {
+			return nil, linkType, fmt.Errorf("truncated packet data")
+		}
+
+		packet, ok := parseCapturedPacket(data[offset:offset+capturedLen], linkType)
+		if ok {
+			packets = append(packets, packet)
+		}
+		offset += capturedLen
+	}
+
+	return packets, linkType, nil
+}
+
+func parseCapturedPacket(frame []byte, linkType int) (capturedPacket, bool) {
+	var headerLen int
+	var ethertypeOffset int
+	switch linkType {
+	case dltEN10MB:
+		headerLen = 14
+		ethertypeOffset = 12
+	case dltLinuxSLL:
+		// Linux cooked socket: 16-byte header, ethertype at bytes 14-15
+		headerLen = 16
+		ethertypeOffset = 14
+	default:
+		return capturedPacket{}, false
+	}
+
+	if len(frame) < headerLen+20 {
+		return capturedPacket{}, false
+	}
+	if binary.BigEndian.Uint16(frame[ethertypeOffset:ethertypeOffset+2]) != 0x0800 {
+		return capturedPacket{}, false
+	}
+
+	ip := frame[headerLen:]
+	ihl := int(ip[0]&0x0f) * 4
+	if len(ip) < ihl+4 || ihl < 20 {
+		return capturedPacket{}, false
+	}
+	if ip[9] != uint8(netwatch.ProtocolTCP) {
+		return capturedPacket{}, false
+	}
+
+	return capturedPacket{
+		IPTotalLen: binary.BigEndian.Uint16(ip[2:4]),
+		Protocol:   ip[9],
+		SrcPort:    binary.BigEndian.Uint16(ip[ihl : ihl+2]),
+		DstPort:    binary.BigEndian.Uint16(ip[ihl+2 : ihl+4]),
+	}, true
 }
 
 func TestUDPServerHelperProcess(*testing.T) {
