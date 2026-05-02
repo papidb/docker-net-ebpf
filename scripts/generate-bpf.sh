@@ -61,8 +61,6 @@ fi
 
 cd "$repo_root/internal/collector/ebpf"
 
-rm -f netwatch_bpfel.go netwatch_bpfeb.go netwatch_bpfel.o netwatch_bpfeb.o
-
 go run github.com/cilium/ebpf/cmd/bpf2go \
   -cc clang \
   -target "$target" \
