@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"path/filepath"
 	"time"
 
 	simpleaggregator "docker-net-ebpf/internal/aggregator/simple"
@@ -13,29 +12,62 @@ import (
 	"docker-net-ebpf/internal/doctor"
 	consoleoutput "docker-net-ebpf/internal/output/console"
 	dockerresolver "docker-net-ebpf/internal/resolver/docker"
+
+	"github.com/spf13/cobra"
 )
 
 func main() {
-	ctx := context.Background()
-	command := "watch"
-	if len(os.Args) > 1 {
-		command = os.Args[1]
+	root := &cobra.Command{
+		Use:   "docker-net-ebpf",
+		Short: "Container network observability using eBPF",
 	}
 
-	switch command {
-	case "doctor":
-		os.Exit(doctor.Run(ctx))
-	case "watch":
-		if err := runWatch(ctx); err != nil {
-			log.Fatal(err)
-		}
-	default:
-		fmt.Fprintf(os.Stderr, "usage: %s [watch|doctor]\n", filepath.Base(os.Args[0]))
-		os.Exit(2)
+	root.AddCommand(doctorCmd())
+	root.AddCommand(watchCmd())
+
+	if err := root.Execute(); err != nil {
+		os.Exit(1)
 	}
 }
 
-func runWatch(ctx context.Context) error {
+func doctorCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "doctor",
+		Short: "Check environment readiness (kernel, cgroup, BPF, Docker)",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			results := doctor.Checks(cmd.Context())
+			for _, result := range results {
+				printDoctorResult(result)
+			}
+
+			failures := doctor.FailureCount(results)
+			if failures > 0 {
+				return fmt.Errorf("doctor failed: %d check(s) failed", failures)
+			}
+
+			fmt.Println("\nDoctor passed: environment looks ready")
+			return nil
+		},
+	}
+}
+
+func watchCmd() *cobra.Command {
+	var interval time.Duration
+
+	cmd := &cobra.Command{
+		Use:   "watch",
+		Short: "Live terminal view of container network traffic",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runWatch(cmd.Context(), interval)
+		},
+	}
+
+	cmd.Flags().DurationVarP(&interval, "interval", "i", 2*time.Second, "polling interval")
+
+	return cmd
+}
+
+func runWatch(ctx context.Context, interval time.Duration) error {
 	if os.Geteuid() != 0 {
 		return fmt.Errorf("run with sudo")
 	}
@@ -68,7 +100,7 @@ func runWatch(ctx context.Context) error {
 	aggregator := simpleaggregator.New(resolver)
 	output := consoleoutput.New()
 
-	ticker := time.NewTicker(2 * time.Second)
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	for range ticker.C {
@@ -89,4 +121,14 @@ func runWatch(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+func printDoctorResult(result doctor.CheckResult) {
+	status := string(result.Status)
+	if result.Err != nil {
+		fmt.Printf("[%s] %-14s %s: %v\n", status, result.Name, result.Details, result.Err)
+		return
+	}
+
+	fmt.Printf("[%s] %-14s %s\n", status, result.Name, result.Details)
 }

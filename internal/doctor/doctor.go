@@ -39,8 +39,8 @@ type CheckResult struct {
 	Err     error
 }
 
-func Run(ctx context.Context) int {
-	results := []CheckResult{
+func Checks(ctx context.Context) []CheckResult {
+	return []CheckResult{
 		checkLinuxKernel(),
 		checkPrivileges(),
 		checkCgroupV2(),
@@ -49,22 +49,17 @@ func Run(ctx context.Context) int {
 		checkDockerSocket(ctx),
 		checkAttachAbility(ctx),
 	}
+}
 
+
+func FailureCount(results []CheckResult) int {
 	failures := 0
 	for _, result := range results {
-		printResult(result)
 		if result.Status == StatusFail {
 			failures++
 		}
 	}
-
-	if failures > 0 {
-		fmt.Printf("\nDoctor failed: %d check(s) failed\n", failures)
-		return 1
-	}
-
-	fmt.Println("\nDoctor passed: environment looks ready")
-	return 0
+	return failures
 }
 
 func checkLinuxKernel() CheckResult {
@@ -114,7 +109,11 @@ func checkPrivileges() CheckResult {
 		return CheckResult{Name: "root/CAP_BPF", Status: StatusPass, Details: strings.Join(parts, "; ")}
 	}
 
-	return CheckResult{Name: "root/CAP_BPF", Status: StatusFail, Details: strings.Join(parts, "; need root or BPF-related capabilities")}
+	return CheckResult{
+		Name:    "root/CAP_BPF",
+		Status:  StatusFail,
+		Details: fmt.Sprintf("%s; need root or BPF-related capabilities", strings.Join(parts, "; ")),
+	}
 }
 
 func checkCgroupV2() CheckResult {
@@ -261,16 +260,6 @@ func effectiveCapabilities() (uint64, error) {
 
 func capabilitySet(caps uint64, bit uint) bool {
 	return caps&(uint64(1)<<bit) != 0
-}
-
-func printResult(result CheckResult) {
-	status := string(result.Status)
-	if result.Err != nil {
-		fmt.Printf("[%s] %-14s %s: %v\n", status, result.Name, result.Details, result.Err)
-		return
-	}
-
-	fmt.Printf("[%s] %-14s %s\n", status, result.Name, result.Details)
 }
 
 func utsnameToString(field interface{}) string {

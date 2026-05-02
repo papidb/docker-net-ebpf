@@ -16,6 +16,27 @@ eBPF programs attach to each container's cgroup and count bytes/packets on ingre
 - Root privileges
 - Docker (for container discovery)
 
+## Privilege Model
+
+Most host-side commands need elevated privileges because they load eBPF programs, attach to cgroups, inspect kernel filesystems, and usually need access to the Docker socket.
+
+- Use `sudo` for local CLI commands such as `doctor`, `watch`, and the planned `record` / `serve` commands.
+- Use `--privileged` (or the equivalent capability and mount set) for the containerized Docker / Compose flows.
+
+Examples:
+
+```bash
+sudo docker-net-ebpf doctor
+sudo docker-net-ebpf watch
+docker compose up
+docker compose -f docker-compose.lab.yml up --build
+```
+
+If you run without elevation, the most common failures are:
+- `permission denied` on `/var/run/docker.sock`
+- `operation not permitted` while creating eBPF maps or attaching programs
+- missing capabilities such as `CAP_BPF`, `CAP_PERFMON`, or `CAP_SYS_ADMIN`
+
 ## Quick Start (Docker)
 
 For a plain observer container:
@@ -71,8 +92,9 @@ Requires Go 1.25+, clang, llvm, libbpf-dev, linux-libc-dev.
 
 ```bash
 go generate ./internal/collector/ebpf/...
-go build -o netwatch .
-sudo ./netwatch
+go build -o docker-net-ebpf ./cmd/docker-net-ebpf
+sudo ./docker-net-ebpf doctor
+sudo ./docker-net-ebpf watch
 ```
 
 `go generate` now goes through `scripts/generate-bpf.sh`.
@@ -141,7 +163,7 @@ sink (terminal, JSONL, SQLite, Prometheus, ...)
 
 ## Current State
 
-The eBPF collector and cgroup attachment work. `main.go` now wires four explicit stages together using the `netwatch` interfaces, while still keeping a simple synchronous loop and console output by default.
+The eBPF collector and cgroup attachment work. `cmd/docker-net-ebpf/main.go` now wires four explicit stages together using the `netwatch` interfaces, while still keeping a simple synchronous loop and console output by default.
 
 What exists:
 - eBPF program with per-CPU hash map (working)

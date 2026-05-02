@@ -5,12 +5,17 @@ script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd -- "$script_dir/.." && pwd)
 
 arch_include=""
+target=""
 
 if command -v gcc >/dev/null 2>&1; then
   gcc_triplet=$(gcc -dumpmachine)
   if [ -d "/usr/include/$gcc_triplet" ]; then
     arch_include="/usr/include/$gcc_triplet"
   fi
+  case "$gcc_triplet" in
+    x86_64-*) target="amd64" ;;
+    aarch64-*|arm64-*) target="arm64" ;;
+  esac
 fi
 
 if [ -z "$arch_include" ] && command -v clang >/dev/null 2>&1; then
@@ -18,12 +23,24 @@ if [ -z "$arch_include" ] && command -v clang >/dev/null 2>&1; then
   if [ -n "$clang_triplet" ] && [ -d "/usr/include/$clang_triplet" ]; then
     arch_include="/usr/include/$clang_triplet"
   fi
+  if [ -z "$target" ]; then
+    case "$clang_triplet" in
+      x86_64-*) target="amd64" ;;
+      aarch64-*|arm64-*) target="arm64" ;;
+    esac
+  fi
 fi
 
 if [ -z "$arch_include" ]; then
   case "$(uname -m)" in
-    x86_64) arch_include="/usr/include/x86_64-linux-gnu" ;;
-    aarch64|arm64) arch_include="/usr/include/aarch64-linux-gnu" ;;
+    x86_64)
+      arch_include="/usr/include/x86_64-linux-gnu"
+      target="amd64"
+      ;;
+    aarch64|arm64)
+      arch_include="/usr/include/aarch64-linux-gnu"
+      target="arm64"
+      ;;
     *)
       echo "unsupported architecture: $(uname -m)" >&2
       exit 1
@@ -37,10 +54,18 @@ if [ ! -d "$arch_include" ]; then
   exit 1
 fi
 
+if [ -z "$target" ]; then
+  echo "unable to determine bpf2go target architecture" >&2
+  exit 1
+fi
+
 cd "$repo_root/internal/collector/ebpf"
+
+rm -f netwatch_bpfel.go netwatch_bpfeb.go netwatch_bpfel.o netwatch_bpfeb.o
 
 go run github.com/cilium/ebpf/cmd/bpf2go \
   -cc clang \
+  -target "$target" \
   -cflags "-O2 -g -Wall" \
   netwatch \
   ../../../bpf/netwatch.bpf.c \
