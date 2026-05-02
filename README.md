@@ -15,16 +15,88 @@ eBPF programs attach to each container's cgroup and count bytes/packets on ingre
 - Linux with eBPF and cgroupv2 support
 - Root privileges
 - Docker (for container discovery)
-- Go 1.25+, clang (for building)
 
-## Usage
+## Quick Start (Docker)
 
-Generate eBPF bindings and build:
+For a plain observer container:
 
 ```bash
-go generate ./...
+docker compose up
+```
+
+## Demo Lab (Docker Compose)
+
+Bring up a self-contained traffic lab plus `netwatch`:
+
+```bash
+docker compose -f docker-compose.lab.yml up --build
+```
+
+This starts:
+- `lab-egress` → repeated Cloudflare downloads
+- `lab-internal` → repeated HTTP calls to `lab-web`
+- `netwatch` → privileged observer attached to the host Docker engine
+
+Use this when you want a reproducible demo without the Lima-only helper script.
+
+To stop the demo:
+
+```bash
+docker compose -f docker-compose.lab.yml down
+```
+
+Or run directly:
+
+```bash
+docker run --rm --privileged \
+  --pid=host \
+  --network=host \
+  -v /sys/fs/cgroup:/sys/fs/cgroup:ro \
+  -v /sys/kernel/btf:/sys/kernel/btf:ro \
+  -v /var/run/docker.sock:/var/run/docker.sock:ro \
+  netwatch
+```
+
+## Platform Support
+
+- **Linux hosts:** supported
+- **OrbStack on macOS:** experimental, but the Compose demo flow has been tested successfully
+- **Docker Desktop on macOS/Windows:** experimental at best; eBPF attaches inside the Linux VM, not to the native host OS
+
+This project always observes a Linux kernel. On macOS that means the Linux VM provided by OrbStack, Docker Desktop, or Lima — not the macOS host network stack itself.
+
+## Build from Source
+
+Requires Go 1.25+, clang, llvm, libbpf-dev, linux-libc-dev.
+
+```bash
+go generate ./internal/collector/ebpf/...
 go build -o netwatch .
 sudo ./netwatch
+```
+
+`go generate` now goes through `scripts/generate-bpf.sh`.
+
+Why that wrapper exists:
+- `bpf2go` needs both the generic Linux headers and the **arch-specific** include directory
+- on Debian/Ubuntu-style systems, `asm/types.h` usually lives under a triplet path such as:
+  - `/usr/include/x86_64-linux-gnu`
+  - `/usr/include/aarch64-linux-gnu`
+- different environments (native Linux, Lima, Docker builder) expose those paths differently
+
+The wrapper script detects the correct arch include directory and passes it to `clang`, so `go generate` works without relying on a manual `/usr/include/asm` symlink hack.
+
+If generation still fails on Linux, make sure the distro headers are installed:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y clang llvm libbpf-dev linux-libc-dev gcc
+```
+
+Or build via Docker:
+
+```bash
+docker build -t netwatch .
 ```
 
 Output:
@@ -99,6 +171,8 @@ What's defined but not yet implemented:
 │   ├── types.go                 # RawTrafficSample, TrafficSample, ContainerInfo
 │   └── interfaces.go            # Collector, Resolver, Aggregator, Output
 ├── main.go                      # Thin pipeline orchestration
+├── Dockerfile                   # Multi-stage build (clang + Go → distroless)
+├── docker-compose.yml           # Privileged sidecar config
 └── go.mod
 ```
 
@@ -106,7 +180,8 @@ What's defined but not yet implemented:
 
 - [x] Extract collector, resolver, aggregator, and console output into interface-based pipeline wiring
 - [ ] Delta computation and counter reset handling
-- [ ] Regenerate BPF objects on Linux for the destination-aware IPv4/TCP key
+- [x] Docker image with multi-stage build (BPF compilation + distroless runtime)
+- [x] Docker Compose sidecar config
 - [ ] JSONL output
 - [ ] SQLite output with time-range queries
 - [ ] Prometheus metrics exporter

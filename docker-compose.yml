@@ -1,0 +1,10 @@
+services:
+  netwatch:
+    build: .
+    privileged: true
+    pid: host
+    network_mode: host
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:ro
+      - /sys/kernel/btf:/sys/kernel/btf:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
