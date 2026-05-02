@@ -18,6 +18,8 @@ eBPF programs attach to each container's cgroup and count bytes/packets on ingre
 
 ## Quick Start (Docker)
 
+For a plain observer container:
+
 ```bash
 docker compose up
 ```
@@ -37,6 +39,12 @@ This starts:
 
 Use this when you want a reproducible demo without the Lima-only helper script.
 
+To stop the demo:
+
+```bash
+docker compose -f docker-compose.lab.yml down
+```
+
 Or run directly:
 
 ```bash
@@ -49,7 +57,13 @@ docker run --rm --privileged \
   netwatch
 ```
 
-> **Platform support:** Linux only. Docker Desktop (macOS/Windows) runs a LinuxKit VM — eBPF will attach inside the VM, not on your host. Use a Linux VM or cloud instance for real results.
+## Platform Support
+
+- **Linux hosts:** supported
+- **OrbStack on macOS:** experimental, but the Compose demo flow has been tested successfully
+- **Docker Desktop on macOS/Windows:** experimental at best; eBPF attaches inside the Linux VM, not to the native host OS
+
+This project always observes a Linux kernel. On macOS that means the Linux VM provided by OrbStack, Docker Desktop, or Lima — not the macOS host network stack itself.
 
 ## Build from Source
 
@@ -59,6 +73,24 @@ Requires Go 1.25+, clang, llvm, libbpf-dev, linux-libc-dev.
 go generate ./internal/collector/ebpf/...
 go build -o netwatch .
 sudo ./netwatch
+```
+
+`go generate` now goes through `scripts/generate-bpf.sh`.
+
+Why that wrapper exists:
+- `bpf2go` needs both the generic Linux headers and the **arch-specific** include directory
+- on Debian/Ubuntu-style systems, `asm/types.h` usually lives under a triplet path such as:
+  - `/usr/include/x86_64-linux-gnu`
+  - `/usr/include/aarch64-linux-gnu`
+- different environments (native Linux, Lima, Docker builder) expose those paths differently
+
+The wrapper script detects the correct arch include directory and passes it to `clang`, so `go generate` works without relying on a manual `/usr/include/asm` symlink hack.
+
+If generation still fails on Linux, make sure the distro headers are installed:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y clang llvm libbpf-dev linux-libc-dev gcc
 ```
 
 Or build via Docker:

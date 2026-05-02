@@ -7,9 +7,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     llvm \
     libbpf-dev \
     linux-libc-dev \
-    && rm -rf /var/lib/apt/lists/* \
-    && ARCH=$(uname -m) \
-    && ln -sf /usr/include/${ARCH}-linux-gnu/asm /usr/include/asm
+    gcc \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
 COPY go.mod go.sum ./
