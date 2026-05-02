@@ -1,0 +1,57 @@
+services:
+  lab-web:
+    image: nginx:alpine
+    container_name: lab-web
+    networks:
+      - ebpf-lab
+
+  lab-egress:
+    image: curlimages/curl
+    container_name: lab-egress
+    command:
+      - sh
+      - -c
+      - |
+        while true; do
+          curl -L -o /dev/null https://speed.cloudflare.com/__down?bytes=10000000
+          sleep 2
+        done
+    networks:
+      - ebpf-lab
+
+  lab-internal:
+    image: alpine
+    container_name: lab-internal
+    command:
+      - sh
+      - -c
+      - |
+        apk add --no-cache curl
+        while true; do
+          for i in $(seq 1 200); do
+            curl -s http://lab-web/ > /dev/null
+          done
+          sleep 1
+        done
+    depends_on:
+      - lab-web
+    networks:
+      - ebpf-lab
+
+  netwatch:
+    build: .
+    container_name: netwatch
+    privileged: true
+    pid: host
+    network_mode: host
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:ro
+      - /sys/kernel/btf:/sys/kernel/btf:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on:
+      - lab-web
+      - lab-egress
+      - lab-internal
+
+networks:
+  ebpf-lab:

@@ -1,3 +1,3 @@
 package ebpfcollector
 
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -cflags "-O2 -g -Wall" netwatch ../../../bpf/netwatch.bpf.c -- -I/usr/include -I/usr/include/aarch64-linux-gnu
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -cflags "-O2 -g -Wall" netwatch ../../../bpf/netwatch.bpf.c -- -I/usr/include
