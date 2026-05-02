@@ -23,9 +23,7 @@ ENV CGO_ENABLED=0
 RUN go generate ./internal/collector/ebpf/...
 RUN go build -trimpath -ldflags="-s -w" -o /netwatch .
 
-FROM alpine:3.22
-
-RUN apk add --no-cache docker-cli
+FROM gcr.io/distroless/static-debian12
 
 COPY --from=builder /netwatch /netwatch
 

@@ -5,40 +5,46 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 
 	"docker-net-ebpf/netwatch"
+
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/client"
 	"golang.org/x/sys/unix"
 )
 
 type Resolver struct {
 	containers map[uint64]netwatch.ContainerInfo
+	client     *client.Client
 }
 
 func New() *Resolver {
 	return &Resolver{}
 }
 
-func (r *Resolver) Discover(_ context.Context) ([]netwatch.ContainerInfo, error) {
-	out, err := exec.Command("docker", "ps", "--format", "{{.ID}} {{.Names}}",).Output()
+func (r *Resolver) Discover(ctx context.Context) ([]netwatch.ContainerInfo, error) {
+	dockerClient, err := r.dockerClient()
+	if err != nil {
+		return nil, err
+	}
+
+	inspected, err := dockerClient.ContainerList(ctx, client.ContainerListOptions{})
 	if err != nil {
 		return nil, err
 	}
 
 	r.containers = make(map[uint64]netwatch.ContainerInfo)
-	containers := make([]netwatch.ContainerInfo, 0)
-	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	containers := make([]netwatch.ContainerInfo, 0, len(inspected.Items))
 
-	for _, line := range lines {
-		parts := strings.Fields(line)
-		if len(parts) < 2 {
+	for _, inspectedContainer := range inspected.Items {
+		name := primaryContainerName(inspectedContainer)
+		if name == "" {
 			continue
 		}
 
-		id := parts[0]
-		name := parts[1]
+		id := inspectedContainer.ID
 		path, err := findCgroupPath(id)
 		if err != nil {
 			log.Printf("could not find cgroup for %s: %v", name, err)
@@ -64,6 +70,22 @@ func (r *Resolver) Discover(_ context.Context) ([]netwatch.ContainerInfo, error)
 	}
 
 	return containers, nil
+}
+
+func (r *Resolver) dockerClient() (*client.Client, error) {
+	if r.client != nil {
+		return r.client, nil
+	}
+
+	client, err := client.New(
+		client.WithHost("unix:///var/run/docker.sock"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	r.client = client
+	return r.client, nil
 }
 
 func (r *Resolver) Resolve(_ context.Context, cgroupID uint64) (netwatch.ContainerInfo, error) {
@@ -110,4 +132,12 @@ func cgroupID(path string) (uint64, error) {
 	}
 
 	return st.Ino, nil
+}
+
+func primaryContainerName(container container.Summary) string {
+	if len(container.Names) == 0 {
+		return ""
+	}
+
+	return strings.TrimPrefix(container.Names[0], "/")
 }
