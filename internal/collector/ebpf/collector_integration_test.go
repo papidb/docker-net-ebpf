@@ -267,6 +267,40 @@ func TestCollectorAttachDetach(t *testing.T) {
 	}
 }
 
+// TestTCPByteCountMatchesTcpdump verifies that the eBPF collector reports the
+// same total byte and packet counts for TCP traffic as an independent observer
+// (tcpdump) sees at the network layer.
+//
+// WHY A SEPARATE ORACLE IS NEEDED FOR TCP
+// ----------------------------------------
+// For UDP the expected byte count is trivial to calculate:
+//
+//   packets * (IPv4 header + UDP header + payload)
+//
+// TCP is different. Every connection carries a variable number of SYN, ACK,
+// FIN, and retransmit segments whose sizes cannot be predicted ahead of time.
+// Re-implementing the kernel's TCP math in a test would couple the test to
+// implementation details and still miss edge cases (e.g. Nagle, delayed ACK,
+// TSO). Instead, we treat tcpdump as a ground-truth oracle: it reads the same
+// raw IPv4 packets off the loopback interface that the eBPF program sees at
+// the sk_buff level, sums their IPv4 total-length fields, and we compare.
+//
+// TEST TOPOLOGY
+// -------------
+//
+//   ┌─────────────────────────────── loopback (lo) ───────────────────────────┐
+//   │                                                                          │
+//   │  TCP echo server subprocess          TCP client (this test process)      │
+//   │  (parent cgroup – NOT observed)      (moved into observed test cgroup)   │
+//   │  127.0.0.1:<serverPort>    <------>  127.0.0.1:<clientPort>              │
+//   │                                                                          │
+//   │              tcpdump --immediate-mode -i lo                              │
+//   │              filter: "tcp and port <serverPort>"                         │
+//   └──────────────────────────────────────────────────────────────────────────┘
+//
+// The echo server runs as a subprocess so it lives in a different cgroup from
+// the client. That keeps both sides of the connection from being attributed to
+// the same observed cgroup (which would double-count bytes).
 func TestTCPByteCountMatchesTcpdump(t *testing.T) {
 	if os.Geteuid() != 0 {
 		t.Skip("requires root")
@@ -534,15 +568,106 @@ func startTCPEchoServerProcess(t *testing.T) string {
 	return strings.TrimSpace(addr)
 }
 
+// ┌─────────────────────────────────────────────────────────────────────────────┐
+// │  PCAP CAPTURE DESIGN NOTES – read this before touching the capture helpers  │
+// └─────────────────────────────────────────────────────────────────────────────┘
+//
+// Getting a reliable pcap capture in a Go integration test turned out to be
+// surprisingly subtle. Three separate bugs had to be diagnosed and fixed. They
+// are documented here so the next person does not have to rediscover them.
+//
+// ── BUG 1: tcpdump -w <file> wrote zero bytes ────────────────────────────────
+//
+// The original implementation used:
+//
+//   tcpdump -i lo -U -w /tmp/.../tcp-PORT.pcap tcp and port PORT
+//
+// tcpdump printed "0 packets captured / 20 packets received by filter".  The
+// kernel BPF filter matched every packet, but the pcap file only ever contained
+// the 24-byte global header – no packet records.
+//
+// Root cause: TPACKET_V3 ring-buffer block batching (see Bug 2 below).  The
+// file-write path was a red herring – the same symptom appeared when switching
+// to stdout (-w -).  We kept the stdout approach anyway because it removes one
+// failure mode (filesystem permissions / tmpfs write restrictions under some
+// Linux container / VM configurations).
+//
+// ── BUG 2: TPACKET_V3 block-retirement timeout (the real culprit) ─────────────
+//
+// Modern libpcap on Linux uses AF_PACKET with TPACKET_V3, a ring-buffer API
+// that batches packets into fixed-size "blocks" before handing them to
+// userspace.  A block is only made available to userspace when EITHER:
+//
+//   a) the block is full (all frame slots used), OR
+//   b) a per-block retirement timeout fires (~200 ms by default).
+//
+// The test sent SIGINT after a 150 ms sleep – shorter than the 200 ms timeout.
+// The kernel had already matched and buffered 20 packets in the ring, but the
+// block had not yet retired, so pcap_dispatch() returned 0 packets dispatched.
+// That is why "packets received by filter" (a kernel-level counter) was 20
+// while "packets captured" (a userspace dispatch counter) was 0.
+//
+// Fix: pass --immediate-mode to tcpdump.  This tells libpcap to call
+// pcap_set_immediate_mode(), which forces the kernel to use TPACKET_V2 (or
+// disables block coalescing in V3) and deliver each packet to userspace as
+// soon as it arrives, with no batching delay.
+//
+// Alternative: increase the sleep between sending traffic and calling
+// stopCapture() to > 200 ms.  That works but is fragile because the timeout
+// is not guaranteed and varies across kernel versions and configurations.
+// --immediate-mode is the correct, portable fix.
+//
+// ── BUG 3: link-type handling in the hand-rolled pcap parser ─────────────────
+//
+// The original parseCapturedPacket assumed the capture used DLT_EN10MB
+// (Ethernet, 14-byte header, ethertype at bytes 12–13).  On the loopback
+// interface tcpdump also reports DLT_EN10MB (link type 1) – confirmed by
+// reading the network field at bytes 20–23 of the pcap global header.
+//
+// However, if tcpdump is run with `-i any` instead of `-i lo`, libpcap uses
+// DLT_LINUX_SLL (Linux cooked socket, link type 113) with a 16-byte header
+// and ethertype at bytes 14–15.  The parser was updated to handle both link
+// types so it will keep working if the interface is ever changed.
+//
+//   DLT_EN10MB  (1)  :  [dst 6B][src 6B][ethertype 2B] | IP header ...
+//   DLT_LINUX_SLL (113): [pkt-type 2B][hw-type 2B][hw-len 2B][hw-addr 8B]
+//                        [protocol 2B]               | IP header ...
+//
+// ── STDOUT PIPE vs FILE ──────────────────────────────────────────────────────
+//
+// We use "-w -" (write pcap to stdout) and collect the bytes via io.ReadAll on
+// the StdoutPipe rather than writing to a file with "-w <path>".  Reasons:
+//
+//   1. Avoids silent write failures if the temp directory is on a filesystem
+//      that rejects writes from the tcpdump process (AppArmor, read-only tmpfs,
+//      etc.).  A pipe write failure would surface immediately as a broken pipe.
+//
+//   2. io.ReadAll reads until EOF, which only occurs after cmd.Wait() (process
+//      exit), so we are guaranteed to have all bytes before we parse.  With a
+//      file we had to trust that os.File.Close() flushed everything, which is
+//      not always the case with SIGINT-initiated shutdown.
+//
+// ── STDERR DRAIN GOROUTINE ───────────────────────────────────────────────────
+//
+// tcpdump writes its "listening on …" startup message and final statistics to
+// stderr.  We read stderr in a goroutine for two reasons:
+//
+//   1. The "listening on" line tells us tcpdump has opened the capture socket
+//      and is ready; we must not generate traffic before that point.
+//
+//   2. If we stop reading stderr, the pipe buffer fills, tcpdump blocks in a
+//      write() call, and cmd.Wait() deadlocks.  The goroutine keeps draining
+//      after "listening on" so that never happens.
+//
+// startPCAPCapture returns a stop function.  Call it after all traffic has been
+// sent; it signals tcpdump with SIGINT and returns the parsed packet slice.
 func startPCAPCapture(t *testing.T, serverPort uint16) func() []capturedPacket {
 	t.Helper()
 
-	// Write pcap data to stdout (-w -) to avoid any file-path permission issues
-	// on the tmpfs used by t.TempDir() under some Linux configurations.
-	// --immediate-mode disables TPACKET_V3 block-batching so packets are
-	// dispatched to userspace as they arrive rather than waiting for the
-	// block-retirement timeout (~200 ms), which would cause us to miss them
-	// when SIGINT fires after a shorter sleep.
+	// --immediate-mode: bypass TPACKET_V3 block batching (see design notes above).
+	// -w -: write pcap to stdout instead of a file (see design notes above).
+	// -U: flush each packet to the output immediately (belt-and-suspenders with
+	//     --immediate-mode; ensures no stdio buffering on the write side either).
 	cmd := exec.Command("tcpdump", "--immediate-mode", "-i", "lo", "-U", "-w", "-", "tcp", "and", "port", strconv.Itoa(int(serverPort)))
 
 	stdout, err := cmd.StdoutPipe()
@@ -603,11 +728,21 @@ func startPCAPCapture(t *testing.T, serverPort uint16) func() []capturedPacket {
 	}
 }
 
+// Link-type constants from the pcap global header (bytes 20–23).
+// See the PCAP CAPTURE DESIGN NOTES above for why both are handled.
 const (
-	dltEN10MB   = 1   // Ethernet
-	dltLinuxSLL = 113 // Linux cooked socket (used by tcpdump on lo)
+	dltEN10MB   = 1   // Ethernet – used by tcpdump -i lo on Linux
+	dltLinuxSLL = 113 // Linux cooked socket – used by tcpdump -i any
 )
 
+// readPCAPPacketsFromBytes parses a pcap byte stream (e.g. from a stdout pipe)
+// and returns all packets that could be decoded as IPv4 TCP frames.
+//
+// The pcap format used here is the legacy "microsecond-resolution, little-endian"
+// variant (magic 0xd4c3b2a1).  Modern tcpdump can also produce pcapng
+// (magic 0x0a0d0d0a); if that ever becomes the default on the target system
+// this function will return an "unsupported pcap magic" error rather than
+// silently returning zero packets.
 func readPCAPPacketsFromBytes(t *testing.T, data []byte) ([]capturedPacket, int, error) {
 	t.Helper()
 
@@ -639,15 +774,26 @@ func readPCAPPacketsFromBytes(t *testing.T, data []byte) ([]capturedPacket, int,
 	return packets, linkType, nil
 }
 
+// parseCapturedPacket decodes one raw pcap frame into a capturedPacket.
+//
+// The frame layout depends on the link type reported in the pcap global header
+// (see the PCAP CAPTURE DESIGN NOTES and dltEN10MB / dltLinuxSLL constants).
+// Only IPv4 TCP frames are accepted; everything else returns (_, false) so the
+// caller can skip it silently.
+//
+// Port numbers are read from the first four bytes of the transport header,
+// which is correct for both TCP and UDP.  We only call this path for TCP but
+// keeping it generic costs nothing and avoids a future footgun.
 func parseCapturedPacket(frame []byte, linkType int) (capturedPacket, bool) {
 	var headerLen int
 	var ethertypeOffset int
 	switch linkType {
 	case dltEN10MB:
+		// Standard Ethernet: 6-byte dst MAC, 6-byte src MAC, 2-byte ethertype.
 		headerLen = 14
 		ethertypeOffset = 12
 	case dltLinuxSLL:
-		// Linux cooked socket: 16-byte header, ethertype at bytes 14-15
+		// Linux cooked socket (tcpdump -i any): 16-byte header, ethertype at 14.
 		headerLen = 16
 		ethertypeOffset = 14
 	default:
