@@ -21,7 +21,7 @@ ENV GOARCH=$TARGETARCH
 ENV CGO_ENABLED=0
 
 RUN go generate ./internal/collector/ebpf/...
-RUN go build -trimpath -ldflags="-s -w" -o /netwatch .
+RUN go build -trimpath -ldflags="-s -w" -o /netwatch ./cmd/docker-net-ebpf
 
 FROM gcr.io/distroless/static-debian12
 

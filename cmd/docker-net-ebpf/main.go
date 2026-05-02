@@ -5,34 +5,54 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"time"
 
 	simpleaggregator "docker-net-ebpf/internal/aggregator/simple"
 	ebpfcollector "docker-net-ebpf/internal/collector/ebpf"
+	"docker-net-ebpf/internal/doctor"
 	consoleoutput "docker-net-ebpf/internal/output/console"
 	dockerresolver "docker-net-ebpf/internal/resolver/docker"
 )
 
 func main() {
-	if os.Geteuid() != 0 {
-		log.Fatal("run with sudo")
+	ctx := context.Background()
+	command := "watch"
+	if len(os.Args) > 1 {
+		command = os.Args[1]
 	}
 
-	ctx := context.Background()
+	switch command {
+	case "doctor":
+		os.Exit(doctor.Run(ctx))
+	case "watch":
+		if err := runWatch(ctx); err != nil {
+			log.Fatal(err)
+		}
+	default:
+		fmt.Fprintf(os.Stderr, "usage: %s [watch|doctor]\n", filepath.Base(os.Args[0]))
+		os.Exit(2)
+	}
+}
+
+func runWatch(ctx context.Context) error {
+	if os.Geteuid() != 0 {
+		return fmt.Errorf("run with sudo")
+	}
 
 	resolver := dockerresolver.New()
 	containers, err := resolver.Discover(ctx)
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 
 	if len(containers) == 0 {
-		log.Fatal("no docker container cgroups found")
+		return fmt.Errorf("no docker container cgroups found")
 	}
 
 	collector, err := ebpfcollector.New()
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 	defer collector.Close()
 
@@ -68,4 +88,5 @@ func main() {
 			log.Printf("write output: %v", err)
 		}
 	}
+	return nil
 }
