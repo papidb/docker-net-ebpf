@@ -28,3 +28,4 @@ FROM gcr.io/distroless/static-debian12
 COPY --from=builder /netwatch /netwatch
 
 ENTRYPOINT ["/netwatch"]
+CMD ["watch"]

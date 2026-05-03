@@ -13,8 +13,8 @@ if command -v gcc >/dev/null 2>&1; then
     arch_include="/usr/include/$gcc_triplet"
   fi
   case "$gcc_triplet" in
-    x86_64-*) target="amd64" ;;
-    aarch64-*|arm64-*) target="arm64" ;;
+    x86_64-*|aarch64-*|arm64-*|riscv64-*|mips64el-*|mipsel-*|ppc64le-*|loongarch64-*) target="bpfel" ;;
+    s390x-*|mips-*|mips64-*|ppc64-*) target="bpfeb" ;;
   esac
 fi
 
@@ -25,8 +25,8 @@ if [ -z "$arch_include" ] && command -v clang >/dev/null 2>&1; then
   fi
   if [ -z "$target" ]; then
     case "$clang_triplet" in
-      x86_64-*) target="amd64" ;;
-      aarch64-*|arm64-*) target="arm64" ;;
+      x86_64-*|aarch64-*|arm64-*|riscv64-*|mips64el-*|mipsel-*|ppc64le-*|loongarch64-*) target="bpfel" ;;
+      s390x-*|mips-*|mips64-*|ppc64-*) target="bpfeb" ;;
     esac
   fi
 fi
@@ -35,11 +35,11 @@ if [ -z "$arch_include" ]; then
   case "$(uname -m)" in
     x86_64)
       arch_include="/usr/include/x86_64-linux-gnu"
-      target="amd64"
+      target="bpfel"
       ;;
     aarch64|arm64)
       arch_include="/usr/include/aarch64-linux-gnu"
-      target="arm64"
+      target="bpfel"
       ;;
     *)
       echo "unsupported architecture: $(uname -m)" >&2
