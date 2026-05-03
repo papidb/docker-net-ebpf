@@ -20,7 +20,7 @@ eBPF programs attach to each container's cgroup and count bytes/packets on ingre
 
 Most host-side commands need elevated privileges because they load eBPF programs, attach to cgroups, inspect kernel filesystems, and usually need access to the Docker socket.
 
-- Use `sudo` for local CLI commands such as `doctor`, `watch`, and the planned `record` / `serve` commands.
+- Use `sudo` for local CLI commands such as `doctor`, `watch`, `record`, and the planned `serve` command.
 - Use `--privileged` (or the equivalent capability and mount set) for the containerized Docker / Compose flows.
 
 Examples:
@@ -28,6 +28,7 @@ Examples:
 ```bash
 sudo docker-net-ebpf doctor
 sudo docker-net-ebpf watch
+sudo docker-net-ebpf record
 docker compose up
 docker compose -f docker-compose.lab.yml up --build
 ```
@@ -95,6 +96,7 @@ go generate ./internal/collector/ebpf/...
 go build -o docker-net-ebpf ./cmd/docker-net-ebpf
 sudo ./docker-net-ebpf doctor
 sudo ./docker-net-ebpf watch
+sudo ./docker-net-ebpf record
 ```
 
 `go generate` now goes through `scripts/generate-bpf.sh`.
@@ -170,22 +172,23 @@ What exists:
 - Docker container discovery via Docker Engine API + cgroup walk
 - `netwatch.Collector`, `Resolver`, `Aggregator`, and `Output` interfaces
 - Concrete Docker resolver, eBPF collector, simple aggregator, and console output
-- CLI entrypoint at `cmd/docker-net-ebpf/` with `watch` and `doctor` commands
+- CLI entrypoint at `cmd/docker-net-ebpf/` with `doctor`, `watch`, and `record` commands
 - Cumulative counter display in terminal
 - Destination-aware sample model and console view for IPv4/TCP traffic by remote IP
 - `doctor` command checking kernel, privileges, cgroup v2, bpffs, BTF, Docker socket, and eBPF attach ability
+- JSONL and SQLite outputs behind `netwatch.Output`, including multi-output fanout
 
 What's defined but not yet implemented:
 - Delta-based aggregation and counter reset handling
 - Proper Linux-side regeneration of BPF bindings after the IPv4/TCP destination key change (`go generate ./...` must be run on Linux with kernel headers and `llvm-strip` available)
 - UDP and IPv6 destination tracking
-- `netwatch.Output` interface (JSONL, SQLite, Prometheus, Kafka)
+- Additional `netwatch.Output` implementations (Prometheus, Kafka)
 
 ## Project Structure
 
 ```
 ├── cmd/
-│   └── docker-net-ebpf/         # CLI entrypoint (watch, doctor)
+│   └── docker-net-ebpf/         # CLI entrypoint (doctor, watch, record)
 │       └── main.go
 ├── bpf/
 │   └── netwatch.bpf.c           # eBPF cgroup_skb programs
@@ -194,6 +197,9 @@ What's defined but not yet implemented:
 │   ├── collector/ebpf/           # eBPF collector + generated bindings
 │   ├── doctor/                   # Environment preflight checks
 │   ├── output/console/           # Console output implementation
+│   ├── output/fanout/            # Multi-output fanout implementation
+│   ├── output/jsonl/             # JSONL output implementation
+│   ├── output/sqlite/            # SQLite output implementation
 │   └── resolver/docker/          # Docker resolver (Engine API over socket)
 ├── netwatch/
 │   ├── types.go                  # RawTrafficSample, TrafficSample, ContainerInfo
@@ -211,7 +217,7 @@ What's defined but not yet implemented:
 ```
 docker-net-ebpf doctor     # preflight environment checks
 docker-net-ebpf watch      # live terminal view of container network traffic
-docker-net-ebpf record     # write samples to JSONL/SQLite
+docker-net-ebpf record     # write samples to JSONL/SQLite with the same interval-driven loop
 docker-net-ebpf top        # query recorded data for a time range
 docker-net-ebpf serve      # expose Prometheus/OpenTelemetry endpoints
 ```
@@ -221,7 +227,8 @@ Example usage:
 ```bash
 sudo docker-net-ebpf doctor
 sudo docker-net-ebpf watch
-sudo docker-net-ebpf record --output jsonl --path ./net.jsonl
+sudo docker-net-ebpf record
+sudo docker-net-ebpf record jsonl ./net.jsonl sqlite ./net.db
 docker-net-ebpf top --from "2026-05-01T18:00:00Z" --to "2026-05-01T22:00:00Z"
 sudo docker-net-ebpf serve --prometheus.addr :9099
 ```
@@ -237,13 +244,13 @@ The CLI wires things together. The real logic lives in `internal/` and `netwatch
 - [x] Docker Engine API resolver (removed docker-cli runtime dependency)
 - [x] `doctor` command — environment preflight checks
 - [x] `watch` command — live terminal view (formerly the default behavior)
-- [ ] CLI framework (Cobra or urfave/cli) with proper flag parsing
+- [x] CLI framework (Cobra) with proper command parsing
 - [ ] Delta computation and counter reset handling
-- [ ] `record` command — write samples to JSONL/SQLite
+- [x] `record` command — write samples to JSONL/SQLite
 - [ ] `top` command — query recorded data for a time range
 - [ ] `serve` command — Prometheus/OpenTelemetry metrics endpoint
-- [ ] JSONL output
-- [ ] SQLite output with time-range queries
+- [x] JSONL output
+- [x] SQLite output with time-range queries
 - [ ] Prometheus metrics exporter
 - [ ] containerd resolver (Kubernetes pod support)
 - [ ] Extend destination-level visibility beyond IPv4/TCP (UDP, IPv6, DNS/service enrichment, optional port breakdown)

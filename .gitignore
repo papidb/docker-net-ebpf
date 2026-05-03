@@ -14,3 +14,8 @@ dist/
 *.exe
 *.test
 *.out
+
+# Output
+output/
+
+*.DS_Store
