@@ -16,6 +16,27 @@ eBPF programs attach to each container's cgroup and count bytes/packets on ingre
 - Root privileges
 - Docker (for container discovery)
 
+## Privilege Model
+
+Most host-side commands need elevated privileges because they load eBPF programs, attach to cgroups, inspect kernel filesystems, and usually need access to the Docker socket.
+
+- Use `sudo` for local CLI commands such as `doctor`, `watch`, and the planned `record` / `serve` commands.
+- Use `--privileged` (or the equivalent capability and mount set) for the containerized Docker / Compose flows.
+
+Examples:
+
+```bash
+sudo docker-net-ebpf doctor
+sudo docker-net-ebpf watch
+docker compose up
+docker compose -f docker-compose.lab.yml up --build
+```
+
+If you run without elevation, the most common failures are:
+- `permission denied` on `/var/run/docker.sock`
+- `operation not permitted` while creating eBPF maps or attaching programs
+- missing capabilities such as `CAP_BPF`, `CAP_PERFMON`, or `CAP_SYS_ADMIN`
+
 ## Quick Start (Docker)
 
 For a plain observer container:
@@ -71,8 +92,9 @@ Requires Go 1.25+, clang, llvm, libbpf-dev, linux-libc-dev.
 
 ```bash
 go generate ./internal/collector/ebpf/...
-go build -o netwatch .
-sudo ./netwatch
+go build -o docker-net-ebpf ./cmd/docker-net-ebpf
+sudo ./docker-net-ebpf doctor
+sudo ./docker-net-ebpf watch
 ```
 
 `go generate` now goes through `scripts/generate-bpf.sh`.
@@ -141,15 +163,17 @@ sink (terminal, JSONL, SQLite, Prometheus, ...)
 
 ## Current State
 
-The eBPF collector and cgroup attachment work. `main.go` now wires four explicit stages together using the `netwatch` interfaces, while still keeping a simple synchronous loop and console output by default.
+The eBPF collector and cgroup attachment work. `cmd/docker-net-ebpf/main.go` now wires four explicit stages together using the `netwatch` interfaces, while still keeping a simple synchronous loop and console output by default.
 
 What exists:
 - eBPF program with per-CPU hash map (working)
-- Docker container discovery via `docker ps` + cgroup walk
+- Docker container discovery via Docker Engine API + cgroup walk
 - `netwatch.Collector`, `Resolver`, `Aggregator`, and `Output` interfaces
-- Concrete Docker resolver, eBPF collector, simple aggregator, and console output wiring in `main.go`
+- Concrete Docker resolver, eBPF collector, simple aggregator, and console output
+- CLI entrypoint at `cmd/docker-net-ebpf/` with `watch` and `doctor` commands
 - Cumulative counter display in terminal
 - Destination-aware sample model and console view for IPv4/TCP traffic by remote IP
+- `doctor` command checking kernel, privileges, cgroup v2, bpffs, BTF, Docker socket, and eBPF attach ability
 
 What's defined but not yet implemented:
 - Delta-based aggregation and counter reset handling
@@ -160,30 +184,67 @@ What's defined but not yet implemented:
 ## Project Structure
 
 ```
+├── cmd/
+│   └── docker-net-ebpf/         # CLI entrypoint (watch, doctor)
+│       └── main.go
 ├── bpf/
-│   └── netwatch.bpf.c          # eBPF cgroup_skb programs
+│   └── netwatch.bpf.c           # eBPF cgroup_skb programs
 ├── internal/
-│   ├── aggregator/simple/       # Simple aggregator implementation
-│   ├── collector/ebpf/          # eBPF collector + generated bindings
-│   ├── output/console/          # Console output implementation
-│   └── resolver/docker/         # Docker resolver implementation
+│   ├── aggregator/simple/        # Simple aggregator implementation
+│   ├── collector/ebpf/           # eBPF collector + generated bindings
+│   ├── doctor/                   # Environment preflight checks
+│   ├── output/console/           # Console output implementation
+│   └── resolver/docker/          # Docker resolver (Engine API over socket)
 ├── netwatch/
-│   ├── types.go                 # RawTrafficSample, TrafficSample, ContainerInfo
-│   └── interfaces.go            # Collector, Resolver, Aggregator, Output
-├── main.go                      # Thin pipeline orchestration
-├── Dockerfile                   # Multi-stage build (clang + Go → distroless)
-├── docker-compose.yml           # Privileged sidecar config
+│   ├── types.go                  # RawTrafficSample, TrafficSample, ContainerInfo
+│   └── interfaces.go             # Collector, Resolver, Aggregator, Output
+├── scripts/
+│   └── generate-bpf.sh           # Portable BPF codegen wrapper
+├── Dockerfile                    # Multi-stage build (clang + Go → distroless)
+├── docker-compose.yml            # Privileged sidecar config
+├── docker-compose.lab.yml        # Full demo lab with traffic generators
 └── go.mod
 ```
+
+## CLI Product Shape
+
+```
+docker-net-ebpf doctor     # preflight environment checks
+docker-net-ebpf watch      # live terminal view of container network traffic
+docker-net-ebpf record     # write samples to JSONL/SQLite
+docker-net-ebpf top        # query recorded data for a time range
+docker-net-ebpf serve      # expose Prometheus/OpenTelemetry endpoints
+```
+
+Example usage:
+
+```bash
+sudo docker-net-ebpf doctor
+sudo docker-net-ebpf watch
+sudo docker-net-ebpf record --output jsonl --path ./net.jsonl
+docker-net-ebpf top --from "2026-05-01T18:00:00Z" --to "2026-05-01T22:00:00Z"
+sudo docker-net-ebpf serve --prometheus.addr :9099
+```
+
+The CLI wires things together. The real logic lives in `internal/` and `netwatch/`, independent of the CLI framework.
 
 ## Roadmap
 
 - [x] Extract collector, resolver, aggregator, and console output into interface-based pipeline wiring
-- [ ] Delta computation and counter reset handling
 - [x] Docker image with multi-stage build (BPF compilation + distroless runtime)
 - [x] Docker Compose sidecar config
+- [x] Docker Compose demo lab with traffic generators
+- [x] Docker Engine API resolver (removed docker-cli runtime dependency)
+- [x] `doctor` command — environment preflight checks
+- [x] `watch` command — live terminal view (formerly the default behavior)
+- [ ] CLI framework (Cobra or urfave/cli) with proper flag parsing
+- [ ] Delta computation and counter reset handling
+- [ ] `record` command — write samples to JSONL/SQLite
+- [ ] `top` command — query recorded data for a time range
+- [ ] `serve` command — Prometheus/OpenTelemetry metrics endpoint
 - [ ] JSONL output
 - [ ] SQLite output with time-range queries
 - [ ] Prometheus metrics exporter
 - [ ] containerd resolver (Kubernetes pod support)
 - [ ] Extend destination-level visibility beyond IPv4/TCP (UDP, IPv6, DNS/service enrichment, optional port breakdown)
+- [ ] Kubernetes DaemonSet deployment
