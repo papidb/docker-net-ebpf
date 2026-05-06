@@ -1,5 +1,7 @@
 # Prometheus Output
 
+Prometheus output exposes the latest in-memory traffic snapshot on an HTTP `/metrics` endpoint.
+
 ## Setup
 
 Add `prometheus` as an output to any command:
@@ -11,6 +13,22 @@ sudo docker-net-ebpf record jsonl prometheus :9099
 ```
 
 Default listen address: `:9099`
+
+Alias:
+
+```text
+prom
+```
+
+## Best use
+
+Use Prometheus output when you want:
+
+- scraping with Prometheus
+- live dashboards in Grafana
+- alerting on traffic spikes or unusual destinations
+
+Unlike JSONL and SQLite, Prometheus does not write samples to disk. It keeps the latest snapshot in memory and serves it on scrape.
 
 ## Metrics
 

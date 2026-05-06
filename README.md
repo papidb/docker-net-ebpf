@@ -49,8 +49,8 @@ Most commands need `sudo` because they load eBPF programs and attach to cgroups.
 
 Multiple outputs can run simultaneously:
 
-| Output | Description | Default path |
-|--------|-------------|-------------|
+| Output | Description | Default destination |
+|--------|-------------|---------------------|
 | `console` | Live terminal table | — |
 | `jsonl` | Append-only JSON lines | `output/traffic.jsonl` |
 | `sqlite` | SQLite database | `output/traffic.db` |
@@ -59,6 +59,14 @@ Multiple outputs can run simultaneously:
 ```bash
 sudo docker-net-ebpf record jsonl ./traffic.jsonl sqlite ./traffic.db prometheus :8080
 ```
+
+Output guides:
+
+- [Outputs overview](docs/outputs/README.md)
+- [Console output](docs/outputs/console.md)
+- [JSONL output](docs/outputs/jsonl.md)
+- [SQLite output](docs/outputs/sqlite.md)
+- [Prometheus output](docs/outputs/prometheus.md)
 
 ## Platform Support
 
@@ -83,7 +91,11 @@ See [docs/architecture.md](docs/architecture.md) for the full breakdown with dia
 ## Documentation
 
 - [Architecture](docs/architecture.md) — how the system works behind the scenes
-- [Prometheus queries](docs/outputs/prometheus.md) — useful PromQL examples
+- [Outputs overview](docs/outputs/README.md) — how to combine and configure outputs
+- [Console output](docs/outputs/console.md) — live terminal behavior
+- [JSONL output](docs/outputs/jsonl.md) — append-only file output
+- [SQLite output](docs/outputs/sqlite.md) — local queryable history
+- [Prometheus output](docs/outputs/prometheus.md) — metrics, scrape config, and useful PromQL
 
 ## Project Structure
 
