@@ -16,6 +16,7 @@ import (
 	fanoutoutput "docker-net-ebpf/internal/output/fanout"
 	jsonloutput "docker-net-ebpf/internal/output/jsonl"
 	dockerresolver "docker-net-ebpf/internal/resolver/docker"
+	prometheusoutput "docker-net-ebpf/internal/output/prometheus"
 	sqliteoutput "docker-net-ebpf/internal/output/sqlite"
 	"docker-net-ebpf/netwatch"
 
@@ -210,7 +211,7 @@ func parseOutputSpecs(args []string, defaults []outputSpec) ([]outputSpec, error
 	for i := 0; i < len(args); i++ {
 		kind := normalizeOutputKind(args[i])
 		if kind == "" {
-			return nil, fmt.Errorf("unknown output %q; valid outputs are console, jsonl, sqlite", args[i])
+			return nil, fmt.Errorf("unknown output %q; valid outputs are console, jsonl, sqlite, prometheus", args[i])
 		}
 
 		spec := outputSpec{kind: kind, path: defaultPath(kind)}
@@ -236,6 +237,8 @@ func newOutput(spec outputSpec) (netwatch.Output, error) {
 		return jsonloutput.New(spec.path)
 	case "sqlite":
 		return sqliteoutput.New(spec.path)
+	case "prometheus":
+		return prometheusoutput.New(spec.path)
 	default:
 		return nil, fmt.Errorf("unsupported output %q", spec.kind)
 	}
@@ -249,6 +252,8 @@ func normalizeOutputKind(value string) string {
 		return "jsonl"
 	case "sqlite", "sqlite3", "db":
 		return "sqlite"
+	case "prometheus", "prom":
+		return "prometheus"
 	default:
 		return ""
 	}
@@ -260,6 +265,8 @@ func defaultPath(kind string) string {
 		return filepath.Join("output", "traffic.jsonl")
 	case "sqlite":
 		return filepath.Join("output", "traffic.db")
+	case "prometheus":
+		return ":9099"
 	default:
 		return ""
 	}

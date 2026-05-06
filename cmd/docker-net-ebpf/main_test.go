@@ -52,6 +52,40 @@ func TestParseOutputSpecsRejectsUnknownOutput(t *testing.T) {
 	}
 }
 
+func TestParseOutputSpecsPrometheusDefault(t *testing.T) {
+	t.Parallel()
+
+	specs, err := parseOutputSpecs([]string{"console", "prometheus"}, []outputSpec{{kind: "console"}})
+	if err != nil {
+		t.Fatalf("parseOutputSpecs returned error: %v", err)
+	}
+
+	if len(specs) != 2 {
+		t.Fatalf("expected 2 specs, got %d", len(specs))
+	}
+
+	if specs[1].kind != "prometheus" || specs[1].path != ":9099" {
+		t.Fatalf("unexpected prometheus spec: %#v", specs[1])
+	}
+}
+
+func TestParseOutputSpecsPrometheusCustomAddr(t *testing.T) {
+	t.Parallel()
+
+	specs, err := parseOutputSpecs([]string{"prometheus", ":8080"}, []outputSpec{{kind: "console"}})
+	if err != nil {
+		t.Fatalf("parseOutputSpecs returned error: %v", err)
+	}
+
+	if len(specs) != 1 {
+		t.Fatalf("expected 1 spec, got %d", len(specs))
+	}
+
+	if specs[0].kind != "prometheus" || specs[0].path != ":8080" {
+		t.Fatalf("unexpected prometheus spec: %#v", specs[0])
+	}
+}
+
 func TestParseOutputSpecsUsesProvidedDefaults(t *testing.T) {
 	t.Parallel()
 
