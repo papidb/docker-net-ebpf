@@ -16,6 +16,6 @@ dist/
 *.out
 
 # Output
-output/
+/output/
 
 *.DS_Store
